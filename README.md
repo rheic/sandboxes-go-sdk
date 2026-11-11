@@ -1,6 +1,7 @@
 # sandboxes-go-sdk
 
-![Rheic blue shark logo](docs/assets/rheic-shark.png)
+<img src="docs/assets/rheic-shark.png" alt="Rheic shark logo" width="180">
+
 
 ## Import path migration
 
@@ -62,6 +63,10 @@ server policy; the daemon must resolve the registered server and enforce both.
 `sandboxes.MCP(client).List` returns redacted gateway, transport, loaded,
 usability, and auth/header-state fields. It never returns credentials, header
 values, or OAuth identity and never starts a server or authentication flow.
+For remote registration, `MCPServerConfig.Headers` is deprecated and rejected.
+Put every remote header value in `SecretHeaders` as host-vault references, for
+example `map[string]string{"X-API-Key": "${api_key}"}`. The SDK requires
+daemon API v0.0.22 or newer before sending these references.
 
 ## Development
 
