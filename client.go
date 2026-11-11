@@ -38,8 +38,8 @@ type MCPService interface {
 	Remove(ctx context.Context, name string) (bool, error)
 }
 
-// MCPServerConfig describes a local stdio server. The daemon validates the
-// executable and working directory and asks for explicit host approval.
+// MCPServerConfig describes a local stdio or remote streamable-HTTP server.
+// The daemon validates the registration and asks for explicit host approval.
 type MCPServerConfig struct {
 	Name, Command, WorkingDirectory string
 	Arguments                       []string
@@ -47,9 +47,11 @@ type MCPServerConfig struct {
 	// Command or URL must be set. Remote hosts are constrained by the
 	// daemon's fail-closed allowlist.
 	URL string
-	// Headers are static, non-secret request headers for the remote
-	// transport. Secret material must come from the host credential broker.
+	// Headers is deprecated. Remote request headers must use SecretHeaders.
 	Headers map[string]string
+	// SecretHeaders contain templates whose ${placeholder} references are
+	// resolved from the daemon's host vault for each request.
+	SecretHeaders map[string]string
 }
 
 // MCPRegistration is either an immediately approved registry summary or a

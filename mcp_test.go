@@ -261,22 +261,37 @@ func TestMCPApproveCallUsesDaemonChallengeWithoutClientGrant(t *testing.T) {
 }
 
 func TestMCPRemoteRegistrationSendsURLAndHeaders(t *testing.T) {
-	client, server, cleanup := newMCPTestClient(t, "0.0.20")
+	client, server, cleanup := newMCPTestClient(t, "0.0.22")
 	defer cleanup()
 	mcp := MCP(client)
 	registration, err := mcp.Register(context.Background(), MCPServerConfig{
-		Name:    "remote-fixture",
-		URL:     "https://mcp.example.com/mcp",
-		Headers: map[string]string{"X-Team": "docs", "Authorization": "Bearer ${token}"},
+		Name:          "remote-fixture",
+		URL:           "https://mcp.example.com/mcp",
+		SecretHeaders: map[string]string{"Authorization": "Bearer ${token}", "X-API-Key": "${api_key}"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !registration.ApprovalRequired || server.registerReq.GetUrl() != "https://mcp.example.com/mcp" || server.registerReq.GetHeaders()["X-Team"] != "docs" || server.registerReq.GetHeaders()["Authorization"] != "Bearer ${token}" {
+	if !registration.ApprovalRequired || server.registerReq.GetUrl() != "https://mcp.example.com/mcp" || len(server.registerReq.GetHeaders()) != 0 || server.registerReq.GetSecretHeaders()["Authorization"] != "Bearer ${token}" || server.registerReq.GetSecretHeaders()["X-API-Key"] != "${api_key}" {
 		t.Fatalf("registration=%+v request=%+v", registration, server.registerReq)
 	}
 	if server.registerReq.GetCommand() != "" {
 		t.Fatalf("remote registration carried a command: %+v", server.registerReq)
+	}
+}
+
+func TestMCPSecretHeadersRequireAPI022(t *testing.T) {
+	client, server, cleanup := newMCPTestClient(t, "0.0.21")
+	defer cleanup()
+	_, err := MCP(client).Register(context.Background(), MCPServerConfig{
+		Name: "remote-fixture", URL: "https://mcp.example.com/mcp",
+		SecretHeaders: map[string]string{"X-API-Key": "${api_key}"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "API v0.0.22") {
+		t.Fatalf("Register error = %v, want API version rejection", err)
+	}
+	if server.registerReq != nil {
+		t.Fatal("secret headers were sent to an older daemon")
 	}
 }
 
@@ -290,10 +305,27 @@ func TestMCPRemoteRegistrationRejectsAmbiguousConfig(t *testing.T) {
 	if _, err := mcp.Register(context.Background(), MCPServerConfig{Name: "fixture", URL: "https://mcp.example.com/mcp", Headers: map[string]string{"Authorization": "Bearer x"}}); err == nil {
 		t.Fatal("literal secret-bearing registration was accepted client-side")
 	}
+	if _, err := mcp.Register(context.Background(), MCPServerConfig{Name: "fixture", URL: "https://mcp.example.com/mcp", Headers: map[string]string{"X-API-Key": "literal"}}); err == nil {
+		t.Fatal("literal API-key header was accepted in static headers")
+	}
+	if _, err := mcp.Register(context.Background(), MCPServerConfig{Name: "fixture", URL: "https://mcp.example.com/mcp", Headers: map[string]string{"X-Team": "${team}"}}); err == nil {
+		t.Fatal("vault placeholder was accepted in static headers")
+	}
 	if _, err := mcp.Register(context.Background(), MCPServerConfig{Name: "fixture", URL: "https://mcp.example.com/mcp", Headers: map[string]string{"Authorization": "Bearer ${}"}}); err == nil {
 		t.Fatal("invalid MCP vault placeholder was accepted client-side")
 	}
 	if _, err := mcp.Register(context.Background(), MCPServerConfig{Name: "fixture", URL: "https://mcp.example.com/mcp", Headers: map[string]string{"Authorization": "Bearer } ${token}"}}); err == nil {
 		t.Fatal("malformed MCP vault placeholder was accepted client-side")
+	}
+	if _, err := mcp.Register(context.Background(), MCPServerConfig{Name: "fixture", URL: "https://mcp.example.com/mcp", Headers: map[string]string{"X-Team": "one", "x-team": "two"}}); err == nil {
+		t.Fatal("case-insensitive duplicate MCP headers were accepted client-side")
+	}
+	if _, err := mcp.Register(context.Background(), MCPServerConfig{Name: "fixture", URL: "https://mcp.example.com/mcp", Headers: map[string]string{"X-Team": "one"}, SecretHeaders: map[string]string{"x-team": "${team}"}}); err == nil {
+		t.Fatal("case-insensitive duplicate static/secret headers were accepted client-side")
+	}
+	for _, headers := range []map[string]string{{"X-Team\x00": "${team}"}, {"X-Team": "${team\x00}"}, {"  ": "${team}"}} {
+		if _, err := mcp.Register(context.Background(), MCPServerConfig{Name: "fixture", URL: "https://mcp.example.com/mcp", SecretHeaders: headers}); err == nil {
+			t.Errorf("invalid secret header was accepted: %#v", headers)
+		}
 	}
 }

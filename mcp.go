@@ -14,6 +14,7 @@ import (
 
 const (
 	mcpMinimumAPIVersion     = "0.0.18"
+	mcpSecretHeadersVersion  = "0.0.22"
 	maxMCPCallArgumentsBytes = 1 << 20
 	maxMCPCallResultBytes    = 4 << 20
 )
@@ -115,35 +116,59 @@ func (s mcpServiceClient) ApproveCall(ctx context.Context, approvalID string) (j
 }
 
 func (s mcpServiceClient) Register(ctx context.Context, server MCPServerConfig) (*MCPRegistration, error) {
-	if server.Name == "" {
-		return nil, errors.New("MCP server name is required")
-	}
-	if server.URL != "" && server.Command != "" {
-		return nil, errors.New("set either command or url, not both")
-	}
-	if server.URL == "" && (server.Command == "" || server.WorkingDirectory == "") {
-		return nil, errors.New("MCP name, command, and absolute working directory are required")
-	}
-	if len(server.Arguments) > 64 || len(server.Headers) > 16 {
-		return nil, errors.New("MCP registration exceeds argument or header limits")
-	}
-	total, err := validateMCPServerConfig(server)
-	if err != nil {
+	if err := validateMCPRegistration(server); err != nil {
 		return nil, err
 	}
-	_ = total
-	if err := s.requireMCPVersion(ctx); err != nil {
+	if err := s.requireMCPRegistrationVersion(ctx, len(server.SecretHeaders) > 0); err != nil {
 		return nil, err
 	}
 	ctx, cancel := s.c.context(ctx)
 	defer cancel()
 	resp, err := s.c.sandboxes.MCPRegisterServer(ctx, &localv1.MCPRegisterServerRequest{
 		Name: server.Name, Command: server.Command, Arguments: append([]string(nil), server.Arguments...), WorkingDirectory: server.WorkingDirectory,
-		Url: server.URL, Headers: maps.Clone(server.Headers),
+		Url: server.URL, SecretHeaders: maps.Clone(server.SecretHeaders),
 	})
 	if err != nil {
 		return nil, mapError(err)
 	}
+	return convertMCPRegistration(resp)
+}
+
+func validateMCPRegistration(server MCPServerConfig) error {
+	if server.Name == "" {
+		return errors.New("MCP server name is required")
+	}
+	if server.URL != "" && (server.Command != "" || len(server.Arguments) > 0 || server.WorkingDirectory != "") {
+		return errors.New("remote MCP registration must not include stdio fields")
+	}
+	if server.URL == "" && (server.Command == "" || server.WorkingDirectory == "") {
+		return errors.New("MCP name, command, and absolute working directory are required")
+	}
+	if server.URL == "" && len(server.Headers)+len(server.SecretHeaders) > 0 {
+		return errors.New("MCP headers are supported only for remote servers")
+	}
+	if len(server.Arguments) > 64 || len(server.Headers)+len(server.SecretHeaders) > 16 {
+		return errors.New("MCP registration exceeds argument or header limits")
+	}
+	_, err := validateMCPServerConfig(server)
+	return err
+}
+
+func (s mcpServiceClient) requireMCPRegistrationVersion(ctx context.Context, needsSecretHeaders bool) error {
+	version, err := Version(s.c).Get(ctx)
+	if err != nil {
+		return fmt.Errorf("verify daemon MCP support: %w", err)
+	}
+	if !apiVersionAtLeast(version.APIVersion, mcpMinimumAPIVersion) {
+		return &Error{Code: errorCodeUnsupported, Message: "MCP requires daemon API v0.0.18 or newer"}
+	}
+	if needsSecretHeaders && !apiVersionAtLeast(version.APIVersion, mcpSecretHeadersVersion) {
+		return &Error{Code: errorCodeUnsupported, Message: "vault-backed MCP headers require daemon API v0.0.22 or newer"}
+	}
+	return nil
+}
+
+func convertMCPRegistration(resp *localv1.MCPRegisterServerResponse) (*MCPRegistration, error) {
 	registration := &MCPRegistration{ApprovalID: resp.GetApprovalId(), ApprovalRequired: resp.GetApprovalRequired()}
 	if resp.GetServer() != nil {
 		converted := convertMCPServer(resp.GetServer())
@@ -250,22 +275,29 @@ func (s mcpServiceClient) List(ctx context.Context, sandboxID string) ([]MCPServ
 	return servers, nil
 }
 
-// validateMCPServerConfig bounds registration size and rejects secret-bearing
-// or control-character header content before any RPC is made.
+// validateMCPServerConfig bounds registration size, validates explicit
+// host-vault templates, and rejects ambiguous header names before RPC.
 func validateMCPServerConfig(server MCPServerConfig) (int, error) {
 	total := len(server.Name) + len(server.Command) + len(server.WorkingDirectory) + len(server.URL)
+	if len(server.Headers) != 0 {
+		return 0, errors.New("static MCP headers are disabled; use SecretHeaders with host-vault references")
+	}
+	headerNames := make(map[string]struct{}, len(server.Headers)+len(server.SecretHeaders))
 	for _, arg := range server.Arguments {
 		total += len(arg)
 	}
-	for key, value := range server.Headers {
-		total += len(key) + len(value)
-		if strings.ContainsAny(value, "\r\n\x00") {
-			return 0, errors.New("MCP header values must not contain control characters")
+	for key, value := range server.SecretHeaders {
+		canonicalName := strings.ToLower(strings.TrimSpace(key))
+		if canonicalName == "" || strings.ContainsAny(key, "\r\n:\x00") || strings.ContainsAny(value, "\r\n\x00") {
+			return 0, errors.New("invalid secret MCP header name or value")
 		}
-		if strings.EqualFold(strings.TrimSpace(key), "authorization") || strings.EqualFold(strings.TrimSpace(key), "proxy-authorization") {
-			if !hasMCPSecretPlaceholder(value) {
-				return 0, errors.New("secret MCP headers must use a host-vault ${placeholder}, not a literal value")
-			}
+		if _, exists := headerNames[canonicalName]; exists {
+			return 0, errors.New("MCP header names must be unique, ignoring case")
+		}
+		headerNames[canonicalName] = struct{}{}
+		total += len(key) + len(value)
+		if strings.ContainsAny(value, "\r\n\x00") || !hasMCPSecretPlaceholder(value) {
+			return 0, errors.New("secret MCP header templates must contain valid host-vault ${placeholder} references")
 		}
 	}
 	if total > 16<<10 {
